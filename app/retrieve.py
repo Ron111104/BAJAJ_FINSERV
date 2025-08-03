@@ -1,68 +1,22 @@
-import os
-import numpy as np
-from openai import OpenAI
-from dotenv import load_dotenv
+import hashlib, os
+from .utils import download_pdf, chunk_text, embed_batch, save_faiss_index, load_faiss_index, search_chunks, call_llm
+from .db import get_document_by_url, insert_document
 
-load_dotenv()
-openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+def query_document(url: str, questions: list[str]):
+    faiss_path = get_document_by_url(url)
 
-# Globals for lazy loading
-FAISS_INDEX = None
-METADATA = None
-DIM = 1536
-INDEX_DIR = "faiss_index"
-INDEX_PATH = os.path.join(INDEX_DIR, "policy.index")
-META_PATH = os.path.join(INDEX_DIR, "metadata.npy")
+    if not faiss_path:
+        content = download_pdf(url)
+        chunks = chunk_text(content)
+        embeddings, chunk_lookup = embed_batch(chunks)
 
-def load_faiss_index():
-    global FAISS_INDEX, METADATA
-    if FAISS_INDEX is None or METADATA is None:
-        # Automatically ingest if index doesn't exist
-        if not os.path.exists(INDEX_PATH) or not os.path.exists(META_PATH):
-            from app.ingest import ingest_local_docs
-            ingest_local_docs()
-        import faiss
-        FAISS_INDEX = faiss.read_index(INDEX_PATH)
-        METADATA = np.load(META_PATH, allow_pickle=True)
-    return FAISS_INDEX, METADATA
+        doc_hash = hashlib.md5(url.encode()).hexdigest()[:12]
+        faiss_path = f"faiss_index/{doc_hash}.index"
+        os.makedirs("faiss_index", exist_ok=True)
 
-def query_document(doc_path: str, question: str, top_k: int = 5) -> str:
-    # Ensure FAISS index + metadata
-    index, meta = load_faiss_index()
+        save_faiss_index(embeddings, chunk_lookup, faiss_path)
+        insert_document(url, faiss_path)
 
-    # 1) Embed the question
-    resp = openai.embeddings.create(
-        input=question,
-        model="text-embedding-ada-002"
-    )
-    q_emb = np.array(resp.data[0].embedding, dtype="float32").reshape(1, -1)
-
-    # 2) FAISS search
-    distances, indices = index.search(q_emb, top_k)
-
-    # 3) Gather snippets for the requested document
-    snippets = []
-    for idx in indices[0]:
-        _, path, chunk = meta[idx]
-        if path == doc_path:
-            snippets.append(chunk)
-    context = "\n---\n".join(snippets) if snippets else "No relevant context found."
-
-    # 4) Generate answer via GPT-4
-    prompt = f"""You are a policy assistant.
-Given these excerpts:
-{context}
-
-Answer the question precisely, and cite which excerpt you used.
-
-Q: {question}
-A:"""
-    response = openai.chat.completions.create(
-        model="gpt-4",
-        messages=[
-            {"role": "system", "content": "You answer using the policy context."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0
-    )
-    return response.choices[0].message.content.strip()
+    index, chunk_lookup = load_faiss_index(faiss_path)
+    context = search_chunks(index, chunk_lookup, questions[0])
+    return call_llm(context, questions)

@@ -1,32 +1,36 @@
-import os
-from fastapi import FastAPI, HTTPException, Header
-from pydantic import BaseModel
-from .ingest import ingest_local_docs
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 from .retrieve import query_document
+import os
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-
 load_dotenv()
+
+
+
 
 app = FastAPI()
 
-class RunRequest(BaseModel):
-    documents: str        # e.g. "data/doc1.pdf"
-    questions: list[str]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # or use specific domains instead of "*" for security
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-class RunResponse(BaseModel):
-    answers: list[str]
+@app.post("/api/v1/hackrx/run")
+async def run(request: Request):
+    auth = request.headers.get("Authorization")
+    if auth != os.getenv("HACKRX_TOKEN"):
+        raise HTTPException(status_code=401, detail="Invalid token")
 
-@app.on_event("startup")
-def startup_event():
-    # Build FAISS index from your sample PDFs
-    ingest_local_docs()
+    body = await request.json()
+    url = body.get("documents")
+    questions = body.get("questions")
 
-@app.post("/api/v1/hackrx/run", response_model=RunResponse)
-def run(req: RunRequest, authorization: str = Header(...)):
-    if authorization != os.getenv("HACKRX_TOKEN"):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    answers = [
-        query_document(req.documents, question) 
-        for question in req.questions
-    ]
-    return RunResponse(answers=answers)
+    if not url or not questions:
+        raise HTTPException(status_code=400, detail="Missing fields")
+
+    result = query_document(url, questions)
+    return JSONResponse(content=result)
